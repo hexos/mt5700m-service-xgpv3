@@ -17,6 +17,8 @@ window.registerPage('settings', function (container) {
     ], s.mode || 'auto');
     const atPort = h('input', { class: 'input', placeholder: 'auto = 自动识别 AT 端口', value: s.at_port || '' });
     const atPortFallback = h('input', { class: 'input', placeholder: '/dev/ttyUSB1', value: s.at_port_fallback || '' });
+    const conn = config.connection || {};
+    const managed = UI.select([['qmodem', '由 QModem 管理（推荐）'], ['self', '本服务自己拨号']], conn.managed || 'qmodem');
     const host = h('input', { class: 'input', value: s.host || '192.168.8.1' });
     const port = h('input', { class: 'input', type: 'number', value: s.port || '20249' });
     const timeout = h('input', { class: 'input', type: 'number', min: '1', max: '60', value: s.timeout || '8' });
@@ -38,6 +40,8 @@ window.registerPage('settings', function (container) {
           ['host', host.value.trim()], ['port', port.value], ['timeout', timeout.value]
         ];
         for (const [k, v] of sets) await Api.call('config-set', { section: 'settings', key: k, value: v });
+        // 拨号归属属于 connection 段：qmodem=只做面板，self=本服务自己拨号
+        await Api.call('config-set', { section: 'connection', key: 'managed', value: managed.value });
       }, '保存通信设置', '保存 AT 通道设置？更改可能影响模组连接。').then(ok => { if (ok) ctx && ctx.refresh(); });
     }
 
@@ -53,6 +57,7 @@ window.registerPage('settings', function (container) {
           h('div', { class: 'control-row' }, [h('label', {}, '连接方式'), mode]),
           h('div', { class: 'control-row' }, [h('label', {}, 'AT 串口'), atPort]),
           h('div', { class: 'control-row' }, [h('label', {}, '兜底串口'), atPortFallback]),
+          h('div', { class: 'control-row' }, [h('label', {}, '拨号归属'), managed]),
           h('div', { class: 'control-row' }, [h('label', {}, 'AT 主机'), host]),
           h('div', { class: 'control-row' }, [h('label', {}, 'AT 端口'), port]),
           h('div', { class: 'control-row' }, [h('label', {}, '响应超时（秒）'), timeout]),

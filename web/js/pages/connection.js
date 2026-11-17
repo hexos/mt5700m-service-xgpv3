@@ -143,19 +143,25 @@ window.registerPage('connection', function (container) {
     const conn = loaded.conn, config = loaded.config;
     const online = conn.connected === true;
     const c = config.connection || {};
+    const delegated = String(c.managed || '').toLowerCase() === 'qmodem';
     const protocolNames = { ip: 'IPv4', ipv6: 'IPv6', ipv4v6: 'IPv4 / IPv6' };
     const root = h('div', {}, [
       h('div', { class: 'hero' }, [
         h('div', {}, [h('h2', {}, '移动数据'), h('div', { class: 'hero-sub' }, '配置 MT5700M 如何连接移动网络。')]),
         h('div', { class: 'status-pill' + (online ? ' online' : '') }, [h('span', { class: 'dot' }), online ? '已连接' : '未连接'])
       ]),
+      delegated ? h('section', { class: 'ui-card control-card', style: { marginBottom: '14px' } }, [
+        h('h3', {}, '拨号由 QModem 管理'),
+        h('div', { class: 'control-desc' }, 'XGPV3 的网卡与拨号归 QModem（mt5700m.connection.managed=qmodem），本面板只读取状态、执行 AT 操作，避免两个管理器互相覆盖网卡配置。'),
+        h('a', { class: 'btn', href: '/cgi-bin/luci/admin/modem/qmodem' }, '打开 QModem 拨号页面')
+      ]) : null,
       h('div', { class: 'card-grid', style: { marginBottom: '14px' } }, [
         UI.card('自动拨号', '', h('div', {}, c.enabled === false ? '已禁用' : '已启用')),
         UI.card('网络接口', '', h('div', {}, conn.network || '--')),
         UI.card('APN', '', h('div', {}, c.apn || '自动')),
         UI.card('保存的 IP 协议', '', h('div', {}, protocolNames[c.pdp_type] || '--'))
       ]),
-      h('div', { style: { display: 'flex', gap: '9px', flexWrap: 'wrap', marginBottom: '14px' } }, online ? [
+      h('div', { style: { display: delegated ? 'none' : 'flex', gap: '9px', flexWrap: 'wrap', marginBottom: '14px' } }, online ? [
         h('button', { class: 'btn primary', onClick: () => UI.confirmRun(() => Api.call('redial'), '重拨', '5G 连接将短暂中断，模组重新拨号。').then(() => ctx && ctx.refresh()) }, '重拨'),
         h('button', { class: 'btn danger', onClick: () => UI.confirmRun(() => Api.call('disconnect'), '断开连接', '现在断开移动数据连接？', { danger: true }).then(() => ctx && ctx.refresh()) }, '断开连接')
       ] : [
