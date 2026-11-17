@@ -1,0 +1,25 @@
+[package]
+name = "mt5700m-service"
+version = "1.0.0"
+edition = "2021"
+description = "MT5700M 蜂窝模组管理服务（Rust 版），适配 mt5700webui-openwrt-server 的 WebSocket 协议超集"
+license = "Apache-2.0"
+
+[[bin]]
+name = "mt5700m-service"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+tokio-tungstenite = "0.21"
+tokio-serial = "5.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+async-trait = "0.1"
+chrono = "0.4"
+libc = "0.2"
+
+[profile.release]
+strip = true
+opt-level = "z"

@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+START=84
+STOP=26
+USE_PROCD=1
+
+service_triggers() {
+	procd_add_reload_trigger mt5700m
+}
+
+start_service() {
+	procd_open_instance main
+	procd_set_param command /usr/bin/mt5700m-service
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 0
+	procd_set_param stderr 0
+	procd_close_instance
+}
+
+reload_service() {
+	procd_send_signal mt5700m-service '*' SIGHUP
+}
