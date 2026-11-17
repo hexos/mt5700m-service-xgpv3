@@ -215,14 +215,12 @@ impl ATConnection for NetworkATConn {
 
 // ========== tom_modem 外部命令连接 ==========
 
-#[allow(dead_code)]
 pub struct TomModemATConn {
     pub config: Arc<Config>,
     is_connected: bool,
     response: Option<String>,
 }
 
-#[allow(dead_code)]
 impl TomModemATConn {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
@@ -261,9 +259,16 @@ impl ATConnection for TomModemATConn {
         }
         let command = String::from_utf8_lossy(data).trim().to_string();
         let s = &self.config.settings;
-        let mut args = vec![s.at_port.clone(), "-c".to_string(), command];
-        // tom_modem 需要一个 feature 开关；串口模式下默认裸串口直连。
-        if let Some(flag) = Self::feature_flag("") {
+        // tom_modem 第一个参数必须是串口；`auto` 时退回 PCUI 扫描或兜底值。
+        let port = if s.at_port_is_auto() {
+            crate::usb::pcui_port().unwrap_or_else(|| s.fallback_port())
+        } else {
+            s.at_port.clone()
+        };
+        let mut args = vec![port.clone(), "-c".to_string(), command];
+        // feature 开关：XGPV3 上 QModem 的 tom_modem 用 `-u` 走 at-daemon 共享串口，
+        // 写成 `-UBUS` 会被解析成非法短参数 `-U`。
+        if let Some(flag) = Self::feature_flag(&s.tom_modem_feature) {
             args.push(flag);
         }
         let output = timeout(
@@ -299,18 +304,39 @@ impl ATConnection for TomModemATConn {
 
 // ========== at-daemon (ubus) 连接 ==========
 
-#[allow(dead_code)]
+/// 通过 `ubus call at-daemon sendat` 与 QModem 共享串口。
+///
+/// sendat 是「一次调用返回完整响应」，因此把响应缓存到 `response`，
+/// 由 `receive()` 一次性取走，复用 `ATClient` 的结束符判定 / 回显清洗逻辑。
+/// 本服务只是观察者，不抢租约；遇到 `settings_pending`（QModem 正在初始化）
+/// 时短暂重试而不是直接失败。
 pub struct UbusATConn {
     pub config: Arc<Config>,
+    /// 当前实际使用的 at_port；自动识别模式下随 at-daemon 状态更新。
+    at_port: String,
+    fallback_port: String,
+    auto_detect: bool,
     is_connected: bool,
     response: Option<String>,
 }
 
-#[allow(dead_code)]
 impl UbusATConn {
     pub fn new(config: Arc<Config>) -> Self {
+        let (at_port, fallback_port, auto_detect) = {
+            let s = &config.settings;
+            let auto = s.at_port_is_auto();
+            let current = if auto {
+                s.fallback_port()
+            } else {
+                s.at_port.trim().to_string()
+            };
+            (current, s.fallback_port(), auto)
+        };
         Self {
             config,
+            at_port,
+            fallback_port,
+            auto_detect,
             is_connected: false,
             response: None,
         }
@@ -319,14 +345,31 @@ impl UbusATConn {
     fn send_timeout(&self) -> u64 {
         self.config.settings.timeout_s.max(2)
     }
+
+    /// 租约 owner 标识，用于 at-daemon 的 at_lease_authorize 鉴权。
+    fn owner(&self) -> &'static str {
+        "mt5700m-service"
+    }
+
 }
 
 #[async_trait]
 impl ATConnection for UbusATConn {
     async fn connect(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let s = &self.config.settings;
+        // 重连时重新识别：模组重插 / USB 重枚举后 /dev/ttyUSBx 可能变化。
+        if self.auto_detect {
+            let preferred = self.at_port.clone();
+            let fallback = self.fallback_port.clone();
+            if let Some(p) = crate::ubus::rediscover_at_port(&preferred, &fallback).await {
+                if p != self.at_port {
+                    crate::log_info!("[UBUS] AT 端口自动切换: {} -> {}", self.at_port, p);
+                    self.at_port = p;
+                }
+            }
+        }
+
         let params = serde_json::json!({
-            "at_port": s.at_port,
+            "at_port": self.at_port,
             "baudrate": 115200u32,
             "databits": 8,
             "parity": 0,
@@ -336,7 +379,7 @@ impl ATConnection for UbusATConn {
         let status = reply.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "success" {
             self.is_connected = true;
-            crate::log_info!("[UBUS] 已连接 at-daemon 串口: {} @ 115200 bps", s.at_port);
+            crate::log_info!("[UBUS] 已连接 at-daemon 串口: {} @ 115200 bps", self.at_port);
             Ok(())
         } else {
             let msg = reply
@@ -358,12 +401,11 @@ impl ATConnection for UbusATConn {
         if command.is_empty() {
             return Ok(data.len());
         }
-        let s = &self.config.settings;
         let params = serde_json::json!({
-            "at_port": s.at_port,
+            "at_port": self.at_port,
             "at_cmd": command,
             "timeout": self.send_timeout(),
-            "owner": "mt5700m-service",
+            "owner": self.owner(),
         });
         let max_retries = 8u32;
         for attempt in 0..max_retries {

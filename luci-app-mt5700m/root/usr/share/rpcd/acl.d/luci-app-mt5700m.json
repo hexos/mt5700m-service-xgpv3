@@ -1,0 +1,12 @@
+{
+	"luci-app-mt5700m": {
+		"description": "Grant access to the MT5700M modem panel",
+		"read": {
+			"ubus": {
+				"service": [ "list" ],
+				"network.interface": [ "status" ]
+			}
+		},
+		"write": {}
+	}
+}

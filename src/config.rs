@@ -1,5 +1,12 @@
 //! 配置模块：从 OpenWrt UCI 读取 mt5700m 配置（兼容 luci-app-mt5700m 的配置项），
 //! 并提供 api 段用于 WebSocket / HTTP 服务参数。
+//!
+//! 连接方式（`mt5700m.settings.mode`）：
+//!   - `auto`       自动：优先 QModem at-daemon（ubus），其次 PCUI 串口，最后网络 TCP
+//!   - `ubus`       经 QModem 的 at-daemon 共享串口（XGPV3 推荐，不与其它拨号程序抢串口）
+//!   - `serial`     独占串口（仅在没有 QModem 托管时使用）
+//!   - `network`    模组网络 AT（192.168.8.1:20249）
+//!   - `tom_modem`  调用 tom_modem 命令行（QModem 自带，`-u` 走 at-daemon）
 
 use std::process::Command;
 
@@ -55,15 +62,51 @@ fn parse_string(v: Option<&str>, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+fn normalize_mode(v: &str) -> String {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "auto" => "auto",
+        "ubus" | "at-daemon" | "atdaemon" => "ubus",
+        "serial" | "uart" => "serial",
+        "network" | "tcp" => "network",
+        "tom_modem" | "tommodem" | "tom-modem" => "tom_modem",
+        _ => "auto",
+    }
+    .to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct SettingsConfig {
     pub enabled: bool,
-    /// auto | serial | network
+    /// auto | ubus | serial | network | tom_modem
     pub mode: String,
+    /// 串口路径，或 `auto` / 空 表示自动识别（UBUS 模式由 at-daemon 报告，串口模式扫描 PCUI）
     pub at_port: String,
+    /// 自动识别失败时的兜底串口（XGPV3 实测 /dev/ttyUSB1）
+    pub at_port_fallback: String,
     pub host: String,
     pub port: u16,
     pub timeout_s: u64,
+    /// tom_modem 的串口特性开关，`UBUS` 会被翻译为 `-u`
+    pub tom_modem_feature: String,
+    /// UBUS 模式下是否仍强行执行 ATE0/CNMI 初始化（默认关闭，避免改动 QModem 的 URC 配置）
+    pub force_init: bool,
+}
+
+impl SettingsConfig {
+    pub fn at_port_is_auto(&self) -> bool {
+        let v = self.at_port.trim();
+        v.is_empty() || v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("detect")
+    }
+
+    pub fn fallback_port(&self) -> String {
+        if !self.at_port_fallback.trim().is_empty() {
+            return self.at_port_fallback.trim().to_string();
+        }
+        if !self.at_port_is_auto() {
+            return self.at_port.trim().to_string();
+        }
+        "/dev/ttyUSB1".to_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +119,16 @@ pub struct ConnectionConfig {
     pub password: String,
     pub metric: u64,
     pub dns_list: String,
+    /// 拨号归属：`qmodem`（默认，交给 QModem，本服务只做面板）或 `self`（本服务自己拨号）
+    pub managed: String,
+    /// 覆盖自动识别的数据网卡（留空则自动）
+    pub netdev: String,
+}
+
+impl ConnectionConfig {
+    pub fn managed_by_qmodem(&self) -> bool {
+        self.managed.eq_ignore_ascii_case("qmodem")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,9 +153,12 @@ impl Default for Config {
                 enabled: true,
                 mode: "auto".to_string(),
                 at_port: String::new(),
+                at_port_fallback: String::new(),
                 host: "192.168.8.1".to_string(),
                 port: 20249,
                 timeout_s: 8,
+                tom_modem_feature: "UBUS".to_string(),
+                force_init: false,
             },
             connection: ConnectionConfig {
                 enabled: true,
@@ -113,6 +169,8 @@ impl Default for Config {
                 password: String::new(),
                 metric: 50,
                 dns_list: String::new(),
+                managed: "self".to_string(),
+                netdev: String::new(),
             },
             api: ApiConfig {
                 websocket_port: 8766,
@@ -131,11 +189,10 @@ impl Config {
         // ---- settings ----
         c.settings.enabled = parse_bool(uci_get("mt5700m.settings.enabled").as_deref(), true);
         let mode = uci_get("mt5700m.settings.mode").unwrap_or_else(|| "auto".to_string());
-        c.settings.mode = match mode.as_str() {
-            "auto" | "serial" | "network" => mode,
-            _ => "auto".to_string(),
-        };
+        c.settings.mode = normalize_mode(&mode);
         c.settings.at_port = uci_get("mt5700m.settings.at_port").unwrap_or_default();
+        c.settings.at_port_fallback =
+            uci_get("mt5700m.settings.at_port_fallback").unwrap_or_default();
         c.settings.host = parse_string(
             uci_get("mt5700m.settings.host").as_deref(),
             "192.168.8.1",
@@ -145,6 +202,12 @@ impl Config {
             20249,
         ) as u16;
         c.settings.timeout_s = parse_u64(uci_get("mt5700m.settings.timeout").as_deref(), 8);
+        c.settings.tom_modem_feature = parse_string(
+            uci_get("mt5700m.settings.tom_modem_feature").as_deref(),
+            "UBUS",
+        );
+        c.settings.force_init =
+            parse_bool(uci_get("mt5700m.settings.force_init").as_deref(), false);
 
         // ---- connection ----
         c.connection.enabled = parse_bool(uci_get("mt5700m.connection.enabled").as_deref(), true);
@@ -163,6 +226,12 @@ impl Config {
         c.connection.password = uci_get("mt5700m.connection.password").unwrap_or_default();
         c.connection.metric = parse_u64(uci_get("mt5700m.connection.metric").as_deref(), 50);
         c.connection.dns_list = uci_get("mt5700m.connection.dns_list").unwrap_or_default();
+        let managed = uci_get("mt5700m.connection.managed").unwrap_or_else(|| "self".to_string());
+        c.connection.managed = match managed.trim().to_ascii_lowercase().as_str() {
+            "qmodem" | "qmodem_mwan" | "external" => "qmodem".to_string(),
+            _ => "self".to_string(),
+        };
+        c.connection.netdev = uci_get("mt5700m.connection.netdev").unwrap_or_default();
 
         // ---- api ----
         c.api.enabled = parse_bool(uci_get("mt5700m.api.enabled").as_deref(), true);
@@ -174,5 +243,48 @@ impl Config {
         c.api.http_port = parse_u64(uci_get("mt5700m.api.http_port").as_deref(), 8088) as u16;
 
         c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_aliases() {
+        assert_eq!(normalize_mode("UBUS"), "ubus");
+        assert_eq!(normalize_mode("at-daemon"), "ubus");
+        assert_eq!(normalize_mode("tom-modem"), "tom_modem");
+        assert_eq!(normalize_mode("tcp"), "network");
+        assert_eq!(normalize_mode("bogus"), "auto");
+    }
+
+    #[test]
+    fn auto_port_detection() {
+        let mut s = SettingsConfig {
+            enabled: true,
+            mode: "ubus".into(),
+            at_port: "auto".into(),
+            at_port_fallback: "/dev/ttyUSB1".into(),
+            host: String::new(),
+            port: 0,
+            timeout_s: 8,
+            tom_modem_feature: "UBUS".into(),
+            force_init: false,
+        };
+        assert!(s.at_port_is_auto());
+        assert_eq!(s.fallback_port(), "/dev/ttyUSB1");
+        s.at_port = "/dev/ttyUSB3".into();
+        assert!(!s.at_port_is_auto());
+        s.at_port_fallback.clear();
+        assert_eq!(s.fallback_port(), "/dev/ttyUSB3");
+    }
+
+    #[test]
+    fn qmodem_managed_flag() {
+        let mut c = Config::default();
+        assert!(!c.connection.managed_by_qmodem());
+        c.connection.managed = "QModem".into();
+        assert!(c.connection.managed_by_qmodem());
     }
 }

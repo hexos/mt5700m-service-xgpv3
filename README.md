@@ -1,37 +1,116 @@
-# mt5700m-service
+# mt5700m-service（XGPV3 / ImmortalWrt 适配版）
 
 把 [luci-app-mt5700m](https://github.com/FAN789/luci-app-mt5700m) 的整套后端逻辑
-（Shell rpcd + C 传输）用 **Rust** 重写而成的独立服务，协议上做成
+（Shell rpcd + C 传输）用 **Rust** 重写而成的独立服务，协议上是
 [mt5700webui-openwrt-server](https://github.com/hexos/mt5700webui-openwrt-server)
-`at-webserver` WebSocket 协议的**超集**，可直接与其前端/同一套 WebSocket 客户端一起使用。
+`at-webserver` WebSocket 协议的**超集**。
 
-> 目标：在 OpenWrt 上，用一个 Rust 二进制替代 `mt5700m-at`、`mt5700m-read`、
-> `mt5700m-manager`、`mt5700m-signal`、`mt5700m-traffic`、`mt5700m-transport`
-> 以及 `rpcd/mt5700m` 这一串脚本/C 程序，提供同样的 MT5700M 管理能力。
+本仓库在原版基础上做了 **XGPV3（西瓜皮 V3）适配**，关键点只有一个：
+**AT 串口不再由本服务独占，改为经 QModem 的 `at-daemon`（ubus）共享。**
+XGPV3 上 QModem 已经 `open()` 了模组的 AT 口，任何再自己 `open()` 的程序都会
+读走 QModem 的响应、造成双方超时——这也是之前同类面板被移出固件的原因。
+
+## XGPV3 数据通路
+
+```
+LuCI /mt5700m/ 或 :8088  ──WebSocket(8766)──>  mt5700m-service (Rust)
+                                                      │
+                          ┌───────────────────────────┴──────────────────────────┐
+                          │  AT 命令：ubus call at-daemon sendat                  │  URC：ubus listen
+                          ▼                                                      ▼
+                    at-daemon（QModem 持有 /dev/ttyUSBx）        qmodem.at.line / qmodem.at.urc
+                          │
+                          ▼
+                     MT5700M 模组（USB / PCIe 转接板 / MHI）
+```
+
+- **不抢串口**：`mode=ubus` 时本服务从不 `open()` 串口，只调用 at-daemon。
+- **端口自动识别**：`at_port=auto` 时取 `ubus call at-daemon list` 中 `is_open=1`
+  的端口；at-daemon 未就绪会等约 15 秒，再退回 `/dev` 节点扫描，最后用
+  `at_port_fallback`（XGPV3 实测 `/dev/ttyUSB1`）。模组重插后自动跟换，无需重启。
+- **URC 不丢**：订阅 `qmodem.at.line` / `qmodem.at.urc` 并按
+  `(restart_epoch, sequence)` 去重，短信/来电 URC 照常推给前端。
+- **不重复初始化**：UBUS 模式下默认不发送 `ATE0`/`AT+CNMI`，避免改动 QModem 依赖的
+  URC 配置（需要时设 `mt5700m.settings.force_init=1`）。
+- **不抢拨号**：`connection.managed=qmodem`（默认）时，连接/断开/重拨只返回提示，
+  不改 `network` UCI、不发 `AT^NDISDUP`，网卡完全交给 QModem。
 
 ## 功能
 
 | 类别 | 说明 |
 | --- | --- |
-| 连接方式 | 串口直连（PCUI AT 端口）/ 网络 TCP（192.168.8.1:20249），`mode=auto` 自动探测 |
+| 连接方式 | `auto` / `ubus` / `serial` / `network` / `tom_modem`，`auto` 优先 ubus |
 | 状态查询 | 身份(ATI/IMEI)、SIM/运营商、本机号码、信号(HCSQ)、签约速率、载波聚合、温度、锁频状态 |
 | 网络/系统/高级 | 分组原始 AT 结果（connection / session / radio / hardware 等） |
 | SMS | 列表(PDU)、发送(UCS2 多段)、删除、清空、SMSC/存储设置 |
 | 锁频 | LTE/NR 频段/频点/小区锁，含输入校验与 CFUN 切换校验 |
-| 连接管理 | connect / disconnect / redial / sync（network UCI 同步 + NDIS 会话） |
+| 连接管理 | connect / disconnect / redial / sync（`managed=self` 时才真正操作网卡） |
 | 其它写操作 | 飞行模式、重启、无线制式、自动拨号、NIC 速率、LED、USB 模式、PDP、SIM PIN、IMS、FOTA、温控等 |
 | 后台采集 | 信号（`AT^HCSQ?` 缓存）、流量（rx/tx 字节差累计总/日/月） |
 
-## WebSocket 协议（`at-webserver` 超集）
+## 安装
+
+### 随固件编译（推荐）
+
+本仓库是标准 OpenWrt 包目录（仓库根目录即 `mt5700m-service` 包），
+`luci-app-mt5700m/` 是配套的 LuCI 入口包。放到源码树后：
+
+```bash
+ln -s /path/to/mt5700m-service package/zz/mt5700m-service   # 或用构建仓库的 prepare.sh
+cp -r luci-app-mt5700m package/zz/
+make menuconfig     # Network -> mt5700m-service；LuCI -> Applications -> luci-app-mt5700m
+make package/mt5700m-service/compile V=s
+```
+
+完整的 XGPV3 自动构建见
+[hexos/immortalwrt-xgp-auto-build](https://github.com/hexos/immortalwrt-xgp-auto-build)，
+`prepare.sh` 会自动拉取本仓库并选中相关包。
+
+### 手动安装 ipk
+
+```sh
+opkg install mt5700m-service_*.ipk luci-app-mt5700m_*.ipk
+/etc/init.d/mt5700m-service enable
+/etc/init.d/mt5700m-service start
+```
+
+## 使用
+
+- LuCI：`网络 → MT5700M 模组`（内嵌 `/mt5700m/`）
+- 浏览器：`http://<路由>/mt5700m/`（uhttpd 静态页）或 `http://<路由>:8088/`（服务自带）
+- WebSocket API：`ws://<路由>:8766`
+- HTTP 只读：`/api/status`、`/api/signal`、`/api/temperature`、`/api/network`、
+  `/api/system`、`/api/traffic`、`/api/connection-status`、`/api/log`、`/api/config`
+
+## 配置（UCI）
+
+```sh
+uci set mt5700m.settings.mode='ubus'              # auto/ubus/serial/network/tom_modem
+uci set mt5700m.settings.at_port='auto'           # auto 或 /dev/ttyUSBx
+uci set mt5700m.settings.at_port_fallback='/dev/ttyUSB1'
+uci set mt5700m.settings.timeout='8'
+uci set mt5700m.settings.force_init='0'           # UBUS 模式下是否重发 ATE0/CNMI
+
+uci set mt5700m.connection.managed='qmodem'       # qmodem=只做面板，self=自己拨号
+uci set mt5700m.connection.netdev=''              # 留空自动识别数据网卡
+
+uci set mt5700m.api.websocket_port='8766'
+uci set mt5700m.api.http_port='8088'
+uci set mt5700m.api.auth_key=''                   # 非空时 WS 先发 {"auth_key":"..."}
+
+uci commit mt5700m
+/etc/init.d/mt5700m-service restart
+```
+
+## WebSocket 协议
 
 - 心跳：客户端发纯文本 `ping`，服务端回 `pong`。
-- 原生 AT 透传：客户端发纯文本 `AT+CMGF?`，服务端回
-  `{"success":true,"data":"...","error":null}`（与 at-webserver 完全一致）。
-- 结构化命令：客户端发 JSON `{"action":"status"}`，服务端回结构化 JSON。
+- 原生 AT 透传：发纯文本 `AT+CSQ`，回 `{"success":true,"data":"...","error":null}`。
+- 结构化命令：发 `{"action":"status"}`。
 - URC 主动上报：`{"type":"raw_data","data":"+CMTI: ..."}`。
 - 可选认证：配置 `auth_key` 后先发 `{"auth_key":"..."}`。
 
-常用结构化 action：
+常用 action：
 
 ```
 status, signal, temperature, network, system, advanced{group}, sms-list, sms-info,
@@ -51,95 +130,50 @@ sms-clear, sms-set{key,value}
 示例：
 
 ```bash
-# 用 websocat / wscat 连接
-ws://路由器IP:8766
-
-# 结构化状态
+websocat ws://192.168.1.1:8766
 {"action":"status"}
-
-# 发送短信
 {"action":"sms-send","number":"10086","text":"你好"}
-
-# NR 频段锁（type=3：仅频段）
 {"action":"lock","rat":"nr","type":3,"bands":"78,79"}
 ```
 
-## HTTP 端点（只读）
+## 排障
 
-- `GET /api/status`、`/api/signal`、`/api/temperature`、`/api/network`
-- `GET /api/system`、`/api/traffic`、`/api/connection-status`、`/api/log`
+```sh
+# at-daemon 是否在、串口归谁
+ubus list at-daemon -v
+ubus call at-daemon list
 
-## Web UI（内置前端）
+# 服务日志（含 [UBUS] 自动识别结果）
+logread | grep -E "mt5700m|UBUS"
 
-`web/` 目录内置了一个**独立静态前端**（纯 HTML/CSS/JS，不依赖 LuCI），
-完整移植了 luci-app-mt5700m 的 8 个页面，通过 WebSocket 对接本服务：
+# 手发 AT
+ubus call at-daemon sendat '{"at_port":"/dev/ttyUSB1","at_cmd":"AT+CSQ"}'
+```
 
-| 路由 | 页面 |
+| 现象 | 原因 / 处理 |
 | --- | --- |
-| `#/status` | 概览（信号 / 载波聚合 / 接口 / 流量） |
-| `#/connection` | 移动数据（拨号 / 会话 / PDP / 配置） |
-| `#/network` | 无线与小区（服务小区 / 诊断 / 锁频 / 无线偏好） |
-| `#/system` | 模组与 SIM（身份 / 运行状态 / 温度 / FOTA） |
-| `#/sms` | 短信（会话 / 发送 / 设置） |
-| `#/advanced` | 高级设置（硬件接口 / SIM / 温度） |
-| `#/settings` | 通信诊断（AT 通道配置） |
-| `#/terminal` | AT 控制台 |
+| 日志 `at-daemon open 失败` | QModem 没开 `use_ubus=1`，或 at-daemon 未运行 |
+| 命令一直 `TIMEOUT` | `at_port` 与 at-daemon 实际打开的端口不一致；保持 `auto` |
+| `settings_pending` | QModem 正在初始化并持有租约，几秒后自动恢复 |
+| 面板能读但拨号按钮报错 | 预期行为：`managed=qmodem`，请到 QModem 操作 |
+| 找不到模组 | XGPV3 转接板断电复位问题，拔 DC 等电容放电后再上电 |
 
-服务启动后，浏览器直接访问：
-
-```
-http://路由器IP:8088/
-```
-
-前端由 `mt5700m-service` 的 HTTP 服务直接托管（无需额外 Web 服务器），
-WebSocket 默认连接同主机的 `8766` 端口；可通过 `localStorage.mt5700m.wsport`
-或 URL 参数 `?wsport=` 覆盖。
-
-## 配置（UCI）
+## 编译（本地）
 
 ```bash
-# 连接方式 auto/serial/network
-uci set mt5700m.settings.mode='auto'
-uci set mt5700m.settings.host='192.168.8.1'
-uci set mt5700m.settings.port='20249'
-
-# 拨号配置
-uci set mt5700m.connection.apn=''
-uci set mt5700m.connection.pdp_type='ipv4v6'
-uci set mt5700m.connection.auth='none'
-
-# API
-uci set mt5700m.api.websocket_port='8766'
-uci set mt5700m.api.http_port='8088'
-uci set mt5700m.api.auth_key=''
-
-uci commit mt5700m
-/etc/init.d/mt5700m-service restart
-```
-
-## 编译
-
-本机（需要 Rust 工具链）：
-
-```bash
-cargo build --release
 cargo test
+cargo build --release
 ```
 
-OpenWrt 交叉编译：把本仓库放到 OpenWrt 源码树的 `package/` 下，然后：
+交叉编译由 OpenWrt buildroot 负责（`rust-package.mk` + `RUST_ARCH_DEPENDS`），
+不需要在构建机上装 Rust。
 
-```bash
-make package/mt5700m-service/compile V=s
-```
+## 与上游的关系
 
-## 与 mt5700webui-openwrt-server 的关系
-
-- `at-webserver`：负责「原始 AT 透传 + netmon + 通知 + 飞行模式」，WebSocket 端口默认 `8765`。
-- `mt5700m-service`：负责「结构化 MT5700M 管理 API」，WebSocket 端口默认 `8766`，
-  提供 luci-app-mt5700m 的完整业务逻辑。两者可同时运行，也可以只用其一。
-
-本服务的 WebSocket 协议是 at-webserver 的**超集**：同一个前端 WebSocket 客户端
-既能发原生 AT 命令，也能发结构化 `{"action":...}` 命令。
+- 本仓库基于 [hexos/mt5700m-service](https://github.com/hexos/mt5700m-service) 的
+  `f0539a3` 版本，新增：UBUS 连接模式接线、AT 端口自动识别、URC 事件总线、
+  MHI/MBIM 网卡识别、`managed` 拨号归属、OpenWrt 打包与 LuCI 入口。
+- 协议、前端页面与原版保持一致，原版前端可直接对接。
 
 ## License
 

@@ -1,0 +1,30 @@
+#!/bin/sh
+# 首次启动：把 MT5700M 面板接到 QModem 的 at-daemon 上（XGPV3 默认路径）。
+#
+# 只在首次安装时执行（uci-defaults 执行后会被删除），用户之后的手动修改不会被覆盖。
+
+[ -f /etc/config/mt5700m ] || exit 0
+
+uci -q batch <<-EOF
+	set mt5700m.settings.enabled='1'
+	set mt5700m.settings.mode='ubus'
+	set mt5700m.settings.at_port='auto'
+	set mt5700m.settings.at_port_fallback='/dev/ttyUSB1'
+	set mt5700m.connection.managed='qmodem'
+	commit mt5700m
+EOF
+
+# QModem 侧必须把串口交给 at-daemon（use_ubus=1），否则 at-daemon 启动后会独占缓冲、
+# 其它程序一律拿不到 AT。这里只翻转「已存在的选项」，不凭空新增未知配置项，
+# 避免 QModem 版本差异导致配置被污染。
+if [ -x /sbin/uci ] && uci -q show qmodem >/dev/null 2>&1; then
+	for section in $(uci -q show qmodem | awk -F'[.=]' '/=modem-slot$/{print $2}'); do
+		if [ -n "$(uci -q get qmodem.$section.use_ubus)" ]; then
+			uci -q set qmodem.$section.use_ubus='1'
+		fi
+	done
+	uci -q commit qmodem
+fi
+
+/etc/init.d/mt5700m-service enable 2>/dev/null
+exit 0

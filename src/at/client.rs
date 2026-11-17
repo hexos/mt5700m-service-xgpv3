@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::sleep;
 
-use crate::at::connection::{ATConnection, NetworkATConn, SerialATConn};
+use crate::at::connection::{
+    ATConnection, NetworkATConn, SerialATConn, TomModemATConn, UbusATConn,
+};
 use crate::config::Config;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(900);
@@ -96,11 +98,13 @@ impl ATClient {
     pub fn new(config: Arc<Config>) -> Result<Self, Box<dyn Error>> {
         let s = &config.settings;
 
-        // 串口直连（serial / auto 已解析出 at_port）或网络 TCP。
-        let conn: Box<dyn ATConnection> = if s.mode == "network" {
-            Box::new(NetworkATConn::new(config.clone()))
-        } else {
-            Box::new(SerialATConn::new(config.clone()))
+        let conn: Box<dyn ATConnection> = match s.mode.as_str() {
+            // XGPV3 默认：复用 QModem at-daemon 持有的串口，绝不自己 open 抢锁。
+            "ubus" => Box::new(UbusATConn::new(config.clone())),
+            "tom_modem" => Box::new(TomModemATConn::new(config.clone())),
+            // 串口直连（serial / auto 已解析出 at_port）或网络 TCP。
+            "network" => Box::new(NetworkATConn::new(config.clone())),
+            _ => Box::new(SerialATConn::new(config.clone())),
         };
 
         let (tx, _) = broadcast::channel(1024);
@@ -201,6 +205,12 @@ impl ATClient {
     }
 
     pub async fn init_module(&self) {
+        // UBUS 模式下串口由 QModem 持有，ATE0/CNMI 会改动 QModem 依赖的 URC 配置，
+        // 默认跳过；确有需要时用 `mt5700m.settings.force_init=1` 打开。
+        if self.config.settings.mode == "ubus" && !self.config.settings.force_init {
+            crate::log_info!("[AT] UBUS 模式跳过模块初始化（QModem 已配置 URC）");
+            return;
+        }
         let _ = self.send_command("ATE0".into()).await;
         let _ = self.send_command("AT+CNMI=2,1,0,2,0".into()).await;
         let _ = self.send_command("AT+CMGF=0".into()).await;

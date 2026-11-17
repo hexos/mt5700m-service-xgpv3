@@ -90,8 +90,8 @@ pub fn normal_slot() -> Option<String> {
     }
 }
 
-/// 找到 normal 模组对应的网络接口名。
-pub fn netdev() -> Option<String> {
+/// 找到 normal 模组对应的网络接口名（仅 USB 直连路径）。
+fn netdev_from_usb() -> Option<String> {
     let slot = normal_slot()?;
     let base = Path::new(SYSFS_USB).join(&slot);
 
@@ -124,6 +124,68 @@ pub fn netdev() -> Option<String> {
         }
     }
     None
+}
+
+/// 通过驱动名 / PCIe uevent 兜底识别数据网卡。
+///
+/// XGPV3 上的 5G 模组可能经转接板以 MHI（`pcie_mhi`）或 MBIM 方式枚举，
+/// 此时没有 `3466:3301` 的 USB 设备节点，只能按驱动名识别。
+/// 打分越小越可信：3466 uevent < MHI/MBIM/QMI 驱动 < 其它 wwan*。
+fn netdev_by_driver() -> Option<String> {
+    let mut candidates: Vec<(u8, String)> = Vec::new();
+    let entries = fs::read_dir(SYS_CLASS_NET).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 跳过虚拟/桥接设备，避免把 docker0、veth 误判为模组网卡。
+        if name == "lo"
+            || name.starts_with("br-")
+            || name.starts_with("veth")
+            || name.starts_with("docker")
+            || name.starts_with("virbr")
+            || name.starts_with("ifb")
+            || name.starts_with("tun")
+            || name.starts_with("tap")
+        {
+            continue;
+        }
+        let dev_link = Path::new(SYS_CLASS_NET).join(&name).join("device");
+        let Ok(dev) = fs::canonicalize(&dev_link) else {
+            continue;
+        };
+        let driver = fs::read_link(dev.join("driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let uevent = fs::read_to_string(dev.join("uevent"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let score = if uevent.contains("3466") {
+            0
+        } else if matches!(
+            driver.as_str(),
+            "mhi_net" | "rmnet_mhi" | "pcie_mhi" | "cdc_mbim" | "qmi_wwan" | "option"
+        ) {
+            1
+        } else if name.starts_with("wwan") || name.starts_with("usb") {
+            2
+        } else {
+            continue;
+        };
+        candidates.push((score, name));
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.into_iter().next().map(|(_, n)| n)
+}
+
+/// 模组数据网卡：USB 直连优先，其次按 MHI/MBIM 驱动识别。
+pub fn netdev() -> Option<String> {
+    netdev_from_usb().or_else(netdev_by_driver)
+}
+
+/// 模组是否在位：USB 设备、数据网卡或 at-daemon 持有的串口任一存在即视为在位。
+pub fn module_present() -> bool {
+    usb_info().is_some() || netdev().is_some() || pcui_port().is_some()
 }
 
 /// 判断某个 tty 设备是否属于 normal 模组的 PCUI AT 端口。

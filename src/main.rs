@@ -49,30 +49,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = config::Config::load_from_uci();
     logger::init(true, "INFO");
 
-    // 解析连接模式：auto 检测 PCUI 串口，否则网络。
-    match config.settings.mode.as_str() {
+    // 解析连接模式。
+    //   auto → 优先 QModem at-daemon（XGPV3 上串口被 QModem 独占，必须共享）
+    //          → 其次 PCUI 串口 → 最后网络 TCP
+    //   ubus → 等待 at-daemon 就绪并自动识别 AT 端口
+    let auto_port = config.settings.at_port_is_auto();
+    let fallback_port = config.settings.fallback_port();
+    // 先取出 mode 的副本再 match：直接用 `config.settings.mode.as_str()` 会在整个
+    // match 期间持有不可变借用，导致各分支里无法写回 mode（E0506）。
+    let mode = config.settings.mode.clone();
+    match mode.as_str() {
         "auto" => {
-            if let Some(port) = usb::pcui_port() {
+            if ubus::current_at_port(&fallback_port).await.is_some() {
+                log_info!("[连接] 检测到 QModem at-daemon，使用 UBUS 共享串口");
+                config.settings.mode = "ubus".to_string();
+            } else if let Some(port) = usb::pcui_port() {
                 log_info!("[连接] 检测到 PCUI AT 端口: {}", port);
                 config.settings.mode = "serial".to_string();
                 config.settings.at_port = port;
             } else {
-                log_info!("[连接] 未检测到 PCUI 端口，使用网络模式 {}:{}", config.settings.host, config.settings.port);
+                log_info!(
+                    "[连接] 未检测到 PCUI 端口，使用网络模式 {}:{}",
+                    config.settings.host,
+                    config.settings.port
+                );
                 config.settings.mode = "network".to_string();
             }
         }
         "serial" => {
-            if config.settings.at_port.is_empty() {
-                config.settings.at_port = usb::pcui_port().unwrap_or_default();
+            if auto_port {
+                config.settings.at_port = usb::pcui_port().unwrap_or_else(|| fallback_port.clone());
+            }
+        }
+        "ubus" => {
+            if auto_port {
+                let (port, source) = ubus::discover_at_port(&fallback_port, 5).await;
+                log_info!("[UBUS] 自动识别 AT 端口: {} (来源: {})", port, source);
+                config.settings.at_port = port;
             }
         }
         _ => {}
     }
 
     log_info!("连接模式: {}", config.settings.mode);
+    if config.settings.mode == "ubus" {
+        log_info!("[UBUS] AT 端口: {}（自动识别: {}）", config.settings.at_port, auto_port);
+    }
     let config = Arc::new(config);
 
     let client = Arc::new(ATClient::new(config.clone())?);
+
+    // UBUS 模式：URC 只能从 at-daemon 的事件总线取（串口被 QModem 独占，
+    // 本服务不能自己读串口，否则会把 QModem 的响应读走）。
+    if config.settings.mode == "ubus" {
+        let tx = client.urc_tx.clone();
+        let port = config.settings.at_port.clone();
+        tokio::spawn(async move {
+            ubus::monitor_events(tx, "mt5700m-service".to_string(), port, auto_port).await;
+        });
+    }
 
     // 初次连接 + 模块初始化。
     {

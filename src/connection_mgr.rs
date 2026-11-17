@@ -123,9 +123,26 @@ async fn bring_down() {
     let _ = run_status(&["ifdown", INTERFACE]);
 }
 
+/// 拨号归属判定：XGPV3 上由 QModem 创建并管理 wwan/mpcie* 接口，
+/// 本服务只做面板；否则会和 QModem 抢同一个网卡、重复改写 network UCI。
+const DELEGATED_MSG: &str =
+    "拨号由 QModem 管理（mt5700m.connection.managed=qmodem），请到 QModem 界面操作";
+
+fn netdev_of(config: &Config) -> Option<String> {
+    let override_dev = config.connection.netdev.trim();
+    if !override_dev.is_empty() {
+        return Some(override_dev.to_string());
+    }
+    usb::netdev()
+}
+
 /// 同步 network UCI 配置（与 shell 版 ensure_network 的核心逻辑一致）。
 pub fn sync_network(config: &Config) {
-    let netdev = match usb::netdev() {
+    if config.connection.managed_by_qmodem() {
+        crate::log_debug!("[连接] managed=qmodem，跳过 network UCI 同步");
+        return;
+    }
+    let netdev = match netdev_of(config) {
         Some(d) => d,
         None => return,
     };
@@ -161,9 +178,19 @@ pub fn sync_network(config: &Config) {
 }
 
 pub async fn sync(client: &Arc<ATClient>, config: &Config) -> Value {
-    sync_network(config);
-    let netdev = usb::netdev().unwrap_or_default();
+    let netdev = netdev_of(config).unwrap_or_default();
     let _ = at_raw(client, "AT").await;
+    if config.connection.managed_by_qmodem() {
+        return json!({
+            "success": true,
+            "delegated": true,
+            "message": DELEGATED_MSG,
+            "network": netdev,
+            "interface": INTERFACE,
+            "interface6": INTERFACE6,
+        });
+    }
+    sync_network(config);
     if config.connection.enabled {
         bring_up(config).await;
     } else {
@@ -178,6 +205,9 @@ pub async fn sync(client: &Arc<ATClient>, config: &Config) -> Value {
 }
 
 pub async fn connect(client: &Arc<ATClient>, config: &Config) -> Value {
+    if config.connection.managed_by_qmodem() {
+        return json!({ "success": false, "delegated": true, "error": DELEGATED_MSG });
+    }
     crate::config::uci_set("mt5700m.connection.enabled", "1");
     crate::config::uci_commit("mt5700m");
     sync_network(config);
@@ -192,7 +222,10 @@ pub async fn connect(client: &Arc<ATClient>, config: &Config) -> Value {
     json!({ "success": true, "message": "连接已启用" })
 }
 
-pub async fn disconnect(client: &Arc<ATClient>, _config: &Config) -> Value {
+pub async fn disconnect(client: &Arc<ATClient>, config: &Config) -> Value {
+    if config.connection.managed_by_qmodem() {
+        return json!({ "success": false, "delegated": true, "error": DELEGATED_MSG });
+    }
     crate::config::uci_set("mt5700m.connection.enabled", "0");
     crate::config::uci_commit("mt5700m");
     let _ = set_ndis_session(client, "0").await;
@@ -201,6 +234,9 @@ pub async fn disconnect(client: &Arc<ATClient>, _config: &Config) -> Value {
 }
 
 pub async fn redial(client: &Arc<ATClient>, config: &Config) -> Value {
+    if config.connection.managed_by_qmodem() {
+        return json!({ "success": false, "delegated": true, "error": DELEGATED_MSG });
+    }
     bring_down().await;
     let _ = set_ndis_session(client, "0").await;
     sleep(Duration::from_secs(2)).await;
@@ -221,14 +257,26 @@ pub fn status_json(config: &Config) -> Value {
     let mut m = Map::new();
 
     let usb_info = usb::usb_info();
+    let netdev = netdev_of(config).unwrap_or_default();
+    let present = usb::module_present() || !netdev.is_empty();
     let state = usb_info
         .as_ref()
         .map(|i| i.state.as_str().to_string())
-        .unwrap_or_else(|| "absent".to_string());
+        .unwrap_or_else(|| {
+            // 没有 USB 节点但能识别到网卡：模组经 MHI/PCIe 转接板枚举。
+            if present {
+                "pcie".to_string()
+            } else {
+                "absent".to_string()
+            }
+        });
     let product = usb_info.as_ref().map(|i| i.product.clone()).unwrap_or_default();
     let slot = usb_info.as_ref().map(|i| i.slot.clone()).unwrap_or_default();
-    let netdev = usb::netdev().unwrap_or_default();
-    let at_port = usb::pcui_port().unwrap_or_default();
+    let at_port = if config.settings.at_port_is_auto() {
+        String::new()
+    } else {
+        config.settings.at_port.clone()
+    };
 
     let up4 = bool_value(
         &run(&[
@@ -265,7 +313,7 @@ pub fn status_json(config: &Config) -> Value {
             .unwrap_or(false)
     };
 
-    let running = config.connection.enabled && state == "normal";
+    let running = config.connection.enabled && (state == "normal" || state == "pcie");
 
     m.insert("running".to_string(), Value::from(running));
     m.insert("connected".to_string(), Value::from((up4 || up6) && carrier));
@@ -281,6 +329,14 @@ pub fn status_json(config: &Config) -> Value {
     m.insert("interface6".to_string(), Value::from(INTERFACE6));
     m.insert("mode".to_string(), Value::from("NCM / ECM"));
     m.insert("metric".to_string(), Value::from(effective_metric(config)));
+    m.insert(
+        "managed".to_string(),
+        Value::from(config.connection.managed.clone()),
+    );
+    m.insert(
+        "at_mode".to_string(),
+        Value::from(config.settings.mode.clone()),
+    );
 
     Value::Object(m)
 }

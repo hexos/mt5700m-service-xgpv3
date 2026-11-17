@@ -1,6 +1,8 @@
 #!/bin/sh /etc/rc.common
 
-START=84
+# 在 QModem（含 at-daemon）之后启动：XGPV3 上 AT 串口由 at-daemon 持有，
+# 早启动也无害（内部会自动重试并重新识别端口），但晚一点可以少几次重连日志。
+START=95
 STOP=26
 USE_PROCD=1
 
@@ -11,12 +13,15 @@ service_triggers() {
 start_service() {
 	procd_open_instance main
 	procd_set_param command /usr/bin/mt5700m-service
+	# 崩溃后 5 秒重启，1 小时内最多 5 次
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 0
 	procd_set_param stderr 0
 	procd_close_instance
 }
 
-reload_service() {
-	procd_send_signal mt5700m-service '*' SIGHUP
-}
+# 不覆盖 reload_service：服务本身没有 SIGHUP 处理器，自定义发 SIGHUP 会被
+# 默认动作直接杀掉（只能靠 procd 重启）。交给 rc.common 的默认行为做 restart。
+
+# 服务不监听 WAN：由 procd 的防火墙默认策略（input 拒绝）与 uhttpd 本身控制，
+# API 端口如需暴露到 LAN 之外，请自行在 /etc/config/firewall 放行并设置 auth_key。

@@ -1,10 +1,18 @@
 config mt5700m 'settings'
 	option enabled '1'
-	option mode 'auto'
-	option at_port ''
+	# XGPV3：串口由 QModem 的 at-daemon 独占，必须走 ubus 共享，不能 serial
+	option mode 'ubus'
+	# auto = 从 at-daemon 的 list 里取它实际打开的 AT 口
+	option at_port 'auto'
+	# at-daemon 尚未就绪时的兜底串口（XGPV3 实测值）
+	option at_port_fallback '/dev/ttyUSB1'
 	option host '192.168.8.1'
 	option port '20249'
 	option timeout '8'
+	# tom_modem 模式的串口特性，UBUS 会翻译成 -u
+	option tom_modem_feature 'UBUS'
+	# UBUS 模式下默认不重发 ATE0/CNMI，避免改动 QModem 的 URC 配置
+	option force_init '0'
 
 config connection 'connection'
 	option enabled '1'
@@ -14,6 +22,12 @@ config connection 'connection'
 	option username ''
 	option password ''
 	option metric '50'
+	option dns_list ''
+	# qmodem = 拨号与网卡由 QModem 管理，本服务只做状态/AT 面板（XGPV3 默认）
+	# self   = 本服务自己写 network UCI + AT^NDISDUP 拨号（独立 USB 场景）
+	option managed 'qmodem'
+	# 留空自动识别数据网卡（USB / MHI / MBIM）
+	option netdev ''
 
 config api 'api'
 	option enabled '1'

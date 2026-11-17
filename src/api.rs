@@ -63,6 +63,8 @@ async fn handle_action(state: &Arc<SharedState>, req: &Value) -> Value {
                     "enabled": c.settings.enabled,
                     "mode": c.settings.mode,
                     "at_port": c.settings.at_port,
+                    "at_port_fallback": c.settings.at_port_fallback,
+                    "force_init": c.settings.force_init,
                     "host": c.settings.host,
                     "port": c.settings.port,
                     "timeout": c.settings.timeout_s
@@ -75,7 +77,9 @@ async fn handle_action(state: &Arc<SharedState>, req: &Value) -> Value {
                     "username": c.connection.username,
                     "password": c.connection.password,
                     "metric": c.connection.metric,
-                    "dns_list": c.connection.dns_list
+                    "dns_list": c.connection.dns_list,
+                    "managed": c.connection.managed,
+                    "netdev": c.connection.netdev
                 },
                 "api": {
                     "enabled": c.api.enabled,
