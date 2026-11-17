@@ -63,7 +63,7 @@ make package/mt5700m-service/compile V=s
 ```
 
 完整的 XGPV3 自动构建见
-[hexos/immortalwrt-xgp-auto-build](https://github.com/hexos/immortalwrt-xgp-auto-build)，
+[hexos/immortalwrt-xgp-auto-build-mt5700m](https://github.com/hexos/immortalwrt-xgp-auto-build-mt5700m)，
 `prepare.sh` 会自动拉取本仓库并选中相关包。
 
 ### 手动安装 ipk

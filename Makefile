@@ -24,7 +24,7 @@ define Package/mt5700m-service
   SECTION:=net
   CATEGORY:=Network
   TITLE:=MT5700M modem management service (Rust)
-  URL:=https://github.com/hexos/mt5700m-service
+  URL:=https://github.com/hexos/mt5700m-service-xgpv3
   DEPENDS:=$(RUST_ARCH_DEPENDS) +ubus +uci
 endef
 
