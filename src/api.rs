@@ -7,6 +7,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,6 +55,48 @@ async fn handle_action(state: &Arc<SharedState>, req: &Value) -> Value {
     let action = get_str(req, "action");
 
     match action.as_str() {
+        // ---- 配置读写 ----
+        "config" => {
+            let c = &state.config;
+            ok(json!({
+                "settings": {
+                    "enabled": c.settings.enabled,
+                    "mode": c.settings.mode,
+                    "at_port": c.settings.at_port,
+                    "host": c.settings.host,
+                    "port": c.settings.port,
+                    "timeout": c.settings.timeout_s
+                },
+                "connection": {
+                    "enabled": c.connection.enabled,
+                    "apn": c.connection.apn,
+                    "pdp_type": c.connection.pdp_type,
+                    "auth": c.connection.auth,
+                    "username": c.connection.username,
+                    "password": c.connection.password,
+                    "metric": c.connection.metric,
+                    "dns_list": c.connection.dns_list
+                },
+                "api": {
+                    "enabled": c.api.enabled,
+                    "websocket_port": c.api.websocket_port,
+                    "auth_key": c.api.auth_key,
+                    "http_port": c.api.http_port
+                }
+            }))
+        }
+        "config-set" => {
+            let section = get_str(req, "section");
+            let key = get_str(req, "key");
+            let value = get_str(req, "value");
+            let uci_key = format!("mt5700m.{}.{}", section, key);
+            if crate::config::uci_set(&uci_key, &value) && crate::config::uci_commit("mt5700m") {
+                ok(json!({ "saved": true }))
+            } else {
+                fail("配置保存失败".to_string())
+            }
+        }
+
         // ---- 查询 ----
         "status" => {
             let cache = crate::signal::read_cached(&state.signal_cache).await;
@@ -320,7 +363,59 @@ pub async fn handle_ws(
     Some(())
 }
 
-/// 极简 HTTP 处理：仅支持 GET /api/<action>（无参数只读）。
+/// 定位前端静态资源根目录（优先环境变量，其次 OpenWrt 安装路径，最后本地 web/）。
+fn web_root() -> Option<PathBuf> {
+    let candidates: Vec<String> = [
+        std::env::var("MT5700M_WEB_ROOT").ok(),
+        Some("/usr/share/mt5700m/web".to_string()),
+        Some("web".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for c in candidates {
+        let p = Path::new(&c);
+        if p.join("index.html").is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    None
+}
+
+fn mime_type(path: &str) -> &'static str {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut resp = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    )
+    .into_bytes();
+    resp.extend_from_slice(body);
+    resp
+}
+
+/// HTTP 处理：GET /api/<action>（只读）+ 前端静态文件托管。
 pub async fn handle_http(stream: TcpStream, state: Arc<SharedState>) {
     let mut buf = [0u8; 2048];
     let mut reader = stream;
@@ -333,26 +428,47 @@ pub async fn handle_http(stream: TcpStream, state: Arc<SharedState>) {
         .nth(1)
         .unwrap_or("/")
         .to_string();
+    let path = path.split('?').next().unwrap_or("/").to_string();
 
-    let action = path
-        .strip_prefix("/api/")
-        .unwrap_or("")
-        .split('?')
-        .next()
-        .unwrap_or("");
+    // ---- /api/* ----
+    if let Some(action) = path.strip_prefix("/api/") {
+        let body = match action {
+            "status" | "signal" | "temperature" | "network" | "system" | "traffic"
+            | "connection-status" | "log" | "config" => {
+                let v = handle_action(&state, &json!({ "action": action })).await;
+                serde_json::to_string(&v).unwrap_or_default()
+            }
+            _ => serde_json::to_string(&fail("未知端点".to_string())).unwrap_or_default(),
+        };
+        let resp = http_response("200 OK", "application/json", body.as_bytes());
+        let _ = reader.write_all(&resp).await;
+        return;
+    }
 
-    let body = match action {
-        "status" | "signal" | "temperature" | "network" | "system" | "traffic" | "connection-status" | "log" => {
-            let v = handle_action(&state, &json!({ "action": action })).await;
-            serde_json::to_string(&v).unwrap_or_default()
+    // ---- 静态文件 ----
+    let root = web_root();
+    let mut rel = path.trim_start_matches('/').to_string();
+    if rel.is_empty() {
+        rel = "index.html".to_string();
+    }
+    let resp = match root {
+        Some(root) => {
+            let file = root.join(&rel);
+            if let Ok(canon) = file.canonicalize() {
+                let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if canon.starts_with(&canon_root) && canon.is_file() {
+                    match std::fs::read(&canon) {
+                        Ok(content) => http_response("200 OK", mime_type(&rel), &content),
+                        Err(_) => http_response("404 Not Found", "text/plain", b"not found"),
+                    }
+                } else {
+                    http_response("404 Not Found", "text/plain", b"not found")
+                }
+            } else {
+                http_response("404 Not Found", "text/plain", b"not found")
+            }
         }
-        _ => serde_json::to_string(&fail("未知端点".to_string())).unwrap_or_default(),
+        None => http_response("404 Not Found", "text/plain", b"web root not found"),
     };
-
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = reader.write_all(resp.as_bytes()).await;
+    let _ = reader.write_all(&resp).await;
 }

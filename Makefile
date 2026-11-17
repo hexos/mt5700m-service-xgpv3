@@ -5,7 +5,7 @@ PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/YOUR_ORG/mt5700m-service.git
+PKG_SOURCE_URL:=https://github.com/hexos/mt5700m-service.git
 PKG_SOURCE_VERSION:=main
 PKG_SOURCE_SUBMODULES:=
 
@@ -41,6 +41,9 @@ define Package/mt5700m-service/install
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) ./files/etc/config/mt5700m $(1)/etc/config/
+
+	$(INSTALL_DIR) $(1)/usr/share/mt5700m/web
+	$(CP) ./web/* $(1)/usr/share/mt5700m/web/
 endef
 
 $(eval $(call BuildPackage,mt5700m-service))

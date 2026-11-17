@@ -69,6 +69,32 @@ ws://路由器IP:8766
 - `GET /api/status`、`/api/signal`、`/api/temperature`、`/api/network`
 - `GET /api/system`、`/api/traffic`、`/api/connection-status`、`/api/log`
 
+## Web UI（内置前端）
+
+`web/` 目录内置了一个**独立静态前端**（纯 HTML/CSS/JS，不依赖 LuCI），
+完整移植了 luci-app-mt5700m 的 8 个页面，通过 WebSocket 对接本服务：
+
+| 路由 | 页面 |
+| --- | --- |
+| `#/status` | 概览（信号 / 载波聚合 / 接口 / 流量） |
+| `#/connection` | 移动数据（拨号 / 会话 / PDP / 配置） |
+| `#/network` | 无线与小区（服务小区 / 诊断 / 锁频 / 无线偏好） |
+| `#/system` | 模组与 SIM（身份 / 运行状态 / 温度 / FOTA） |
+| `#/sms` | 短信（会话 / 发送 / 设置） |
+| `#/advanced` | 高级设置（硬件接口 / SIM / 温度） |
+| `#/settings` | 通信诊断（AT 通道配置） |
+| `#/terminal` | AT 控制台 |
+
+服务启动后，浏览器直接访问：
+
+```
+http://路由器IP:8088/
+```
+
+前端由 `mt5700m-service` 的 HTTP 服务直接托管（无需额外 Web 服务器），
+WebSocket 默认连接同主机的 `8766` 端口；可通过 `localStorage.mt5700m.wsport`
+或 URL 参数 `?wsport=` 覆盖。
+
 ## 配置（UCI）
 
 ```bash
