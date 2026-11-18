@@ -21,6 +21,12 @@ define Package/luci-app-mt5700m/description
   LuCI menu entry and ACL for the MT5700M modem panel served at /mt5700m/.
 endef
 
+# 纯文件包没有源码目录，必须显式给空的 Compile，否则 package.mk 的默认
+# Build/Compile/Default 会去 build_dir/<name>-<ver> 里跑 make，
+# 报 "No targets specified and no makefile found"。
+define Build/Compile
+endef
+
 define Package/luci-app-mt5700m/install
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-mt5700m.json $(1)/usr/share/luci/menu.d/
